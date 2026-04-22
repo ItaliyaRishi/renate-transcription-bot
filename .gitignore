@@ -1,0 +1,45 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+npm-debug.log*
+.npm/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+auth/
+*.auth.json
+
+# Audio / media artifacts
+*.wav
+*.mp3
+*.mp4
+*.webm
+*.pcm
+
+# MinIO / docker volumes
+data/
+minio-data/
+pg-data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
