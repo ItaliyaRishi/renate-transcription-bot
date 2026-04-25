@@ -153,12 +153,26 @@ export async function attachCaptionObserver(
         }
       }
 
+      // A caption row must live under the caption-badge subtree — anything
+      // else is UI chrome (the floating "Jump to bottom" button, reaction
+      // toasts, etc.) that also fires mutations. Cheapest rejection: walk
+      // ancestors and bail out if we hit a role="button" before the badge.
+      function isUiChrome(el: Element, boundary: Element): boolean {
+        let cur: Element | null = el;
+        while (cur && cur !== boundary) {
+          if (cur.getAttribute("role") === "button") return true;
+          cur = cur.parentElement;
+        }
+        return false;
+      }
+
       function attach(container: Element) {
         for (const child of Array.from(container.children)) emit(child);
 
         const obs = new MutationObserver((muts) => {
           for (const m of muts) {
             if (m.target instanceof Element) {
+              if (isUiChrome(m.target, container)) continue;
               const row =
                 m.target.closest('[role="listitem"]') ??
                 (m.target.parentElement?.closest('[role="listitem"]') as Element | null) ??
@@ -166,7 +180,7 @@ export async function attachCaptionObserver(
               if (row instanceof Element) emit(row);
             }
             for (const node of Array.from(m.addedNodes)) {
-              if (node instanceof Element) emit(node);
+              if (node instanceof Element && !isUiChrome(node, container)) emit(node);
             }
           }
         });
@@ -237,6 +251,12 @@ async function enableCaptions(page: Page): Promise<void> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     if (attempt > 1) await page.waitForTimeout(BACKOFF_MS);
 
+    // Meet auto-hides the bottom toolbar after ~3s of no mouse movement.
+    // Headful Chromium via Playwright rarely generates synthetic mouse
+    // events, so the CC button stays hidden and our selector misses. Nudge
+    // the mouse into the meeting canvas to force the toolbar to render.
+    await revealToolbar(page).catch(() => {});
+
     const candidates = await page
       .locator(selectors.captionsToggleButton)
       .elementHandles()
@@ -283,6 +303,23 @@ async function enableCaptions(page: Page): Promise<void> {
     { attempts: MAX_ATTEMPTS },
     "captions enablement FAILED: toggle not found or container never rendered — downstream name attribution will fall back to roster"
   );
+}
+
+// Meet hides the bottom toolbar (CC toggle, mic, cam, leave) after a few
+// seconds of no mouse activity. We jiggle the cursor across the viewport
+// center + bottom to force the toolbar to fade back in before we search
+// for the captions button.
+async function revealToolbar(page: Page): Promise<void> {
+  const viewport = page.viewportSize();
+  if (!viewport) return;
+  const cx = Math.floor(viewport.width / 2);
+  const cy = Math.floor(viewport.height / 2);
+  const by = viewport.height - 40; // just above the toolbar strip
+  // Two small movements guarantee a mousemove event fires regardless of
+  // the previous cursor position.
+  await page.mouse.move(cx, cy, { steps: 5 });
+  await page.mouse.move(cx, by, { steps: 10 });
+  await page.waitForTimeout(500);
 }
 
 // Resolve when either the toggle flips to "Turn off captions" OR the caption

@@ -58,14 +58,24 @@ pactl set-default-source meet_sink.monitor
 
 echo "[entrypoint] DISPLAY=${DISPLAY}; default sink=meet_sink"
 
-# Propagate SIGTERM to all children so docker stop completes quickly.
+# Forward SIGTERM to the bot only. Do NOT kill Xvfb yet — the bot needs
+# Playwright/Chromium alive during its shutdown (stop ffmpeg, drain
+# transcribe queue, enqueue finalize).
 _term() {
-  echo "[entrypoint] received SIGTERM"
+  echo "[entrypoint] received SIGTERM, forwarding to bot"
   kill -TERM "${BOT_PID:-0}" 2>/dev/null || true
-  kill -TERM "${XVFB_PID:-0}" 2>/dev/null || true
 }
 trap _term SIGTERM SIGINT
 
 "$@" &
 BOT_PID=$!
-wait "$BOT_PID"
+
+# First wait returns when the trap fires (interrupted by signal). The
+# second wait blocks until the child actually exits, giving Node time to
+# finish its shutdown() handler. Without this, PID 1 exits the instant
+# the signal is seen and Docker SIGKILLs the bot mid-shutdown.
+wait "$BOT_PID" 2>/dev/null || true
+wait "$BOT_PID" 2>/dev/null || true
+exit_code=$?
+kill -TERM "${XVFB_PID:-0}" 2>/dev/null || true
+exit "$exit_code"

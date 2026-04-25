@@ -10,8 +10,9 @@ import pino from "pino";
 import { getAudioChunk, putAudioChunk } from "./s3.js";
 import {
   mergeSegmentsWithSpeakers,
-  reconcileSpeakers,
+  resolveClusterNames,
   type DomCaptionRecord,
+  type NameEvent,
   type PyannoteTurn,
 } from "./reconcile.js";
 import {
@@ -46,20 +47,32 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
   const captions = await drainCaptionStream(redis, sessionId);
   if (captions.length) await persistDomCaptions(pg, sessionId, captions);
 
-  // Fallback roster: Redis first, then sessions.metadata.expectedSpeakers.
+  // 1b) Drain the active-speaker tile stream. Fires during spans Meet's own
+  // captions don't (Hindi monologue, mumbled speech, cross-talk).
+  const tileEvents = await drainActiveSpeakerStream(redis, sessionId);
+
+  // Roster precedence: sessions.metadata.expectedSpeakers (caller override)
   // Metadata wins if present — it's the caller's explicit authority.
   const roster = await readRoster(redis, pg, sessionId);
+
+  // T0 in wall-clock ms. Captions + tile events use Date.now(); pyannote
+  // turns are call-relative seconds, so we need an anchor to put them in
+  // the same coordinate system. sessions.started_at is set when the bot
+  // transitions to 'joining' — audio capture starts shortly after, so this
+  // is a few seconds off at worst (tolerable given turn durations of 2-10s).
+  const startedAtMs = await readSessionStartedAt(pg, sessionId);
+
   log.info(
     {
       sessionId,
       captions: captions.length,
+      tileEvents: tileEvents.length,
       rosterNames: roster.names,
       rosterSource: roster.source,
+      startedAtMs,
     },
     "name sources drained"
   );
-
-  const nameEvents = captions;
 
   // 1a) Resolve a speaker-count hint for the diarizer. Priority:
   //   (i)   distinct speaker names from captions (most reliable)
@@ -67,7 +80,7 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
   //   (iii) roster length (captions may have been blocked but names are known)
   //   (iv)  safe range band 2..6 so the diarizer can still estimate
   const distinctCaptionNames = new Set(
-    nameEvents.map((c) => c.speakerName).filter((n) => n && n !== "Unknown")
+    captions.map((c) => c.speakerName).filter((n) => n && n !== "Unknown")
   );
   let numSpeakers: number | undefined;
   let minSpeakers: number | undefined;
@@ -122,35 +135,28 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
     log.error({ err, sessionId }, "diarize failed; falling back to DOM-only speakers");
   }
 
-  // 4) Reconcile clusters with DOM caption names. For any cluster we can't
-  // name from captions, try the roster (Redis scrape + expectedSpeakers
-  // override) next, in first-appearance order. Anything still unresolved
-  // falls back to "Speaker 1", "Speaker 2", ....
-  const speakerMap = reconcileSpeakers(turns, nameEvents);
-  const resolution: Record<string, "captions" | "roster" | "fallback"> = {};
-  for (const c of Object.keys(speakerMap)) resolution[c] = "captions";
+  // 4) Fuse caption + tile events against diarization turns. Captions are
+  // weighted 2×, tile hits 1×; winners canonicalize against the roster.
+  // Clusters with no evidence take the next unused roster entry, else
+  // "Speaker N".
+  const nameEvents: NameEvent[] = [
+    ...captions.map((c) => ({
+      tSec: toCallRelSec((c.startTs + c.endTs) / 2, startedAtMs),
+      name: c.speakerName,
+      source: "caption" as const,
+    })),
+    ...tileEvents.map((e) => ({
+      tSec: toCallRelSec(e.tMs, startedAtMs),
+      name: e.name,
+      source: "tile" as const,
+    })),
+  ];
 
-  const unresolvedClusters: string[] = [];
-  for (const t of turns) {
-    if (!speakerMap[t.cluster] && !unresolvedClusters.includes(t.cluster)) {
-      unresolvedClusters.push(t.cluster);
-    }
-  }
-
-  const usedNames = new Set(Object.values(speakerMap).map((n) => n.toLowerCase()));
-  const availableRoster = roster.names.filter((n) => !usedNames.has(n.toLowerCase()));
-
-  let fallbackCounter = 1;
-  for (const cluster of unresolvedClusters) {
-    const next = availableRoster.shift();
-    if (next) {
-      speakerMap[cluster] = next;
-      resolution[cluster] = "roster";
-    } else {
-      speakerMap[cluster] = `Speaker ${fallbackCounter++}`;
-      resolution[cluster] = "fallback";
-    }
-  }
+  const { clusterToName: speakerMap, resolution } = resolveClusterNames(
+    turns,
+    nameEvents,
+    roster.names
+  );
   log.info(
     { sessionId, speakerMap, resolution, rosterSource: roster.source },
     "speaker map"
@@ -176,10 +182,10 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
   if (turns.length) {
     finalRows = mergeSegmentsWithSpeakers(segs, turns, speakerMap);
   } else {
-    // Graceful degrade: no diarization → use any name event (caption or
-    // active-speaker) whose interval overlaps each segment most.
+    // Graceful degrade: no diarization → attribute each Sarvam segment to
+    // the caption row whose interval overlaps it most.
     finalRows = segs.map((s) => {
-      const best = pickOverlap(s.startTs, s.endTs, nameEvents);
+      const best = pickOverlap(s.startTs, s.endTs, captions);
       return {
         startTs: s.startTs,
         endTs: s.endTs,
@@ -211,10 +217,45 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
   });
   await redis.del(
     `captions:${sessionId}`,
+    `active_speaker:${sessionId}`,
     `session:${sessionId}:alive`,
     `session:${sessionId}:roster`
   );
   log.info({ sessionId }, "session complete");
+}
+
+async function drainActiveSpeakerStream(
+  redis: Redis,
+  sessionId: string
+): Promise<Array<{ tMs: number; name: string }>> {
+  const key = `active_speaker:${sessionId}`;
+  const entries = (await redis.xrange(key, "-", "+")) as Array<[string, string[]]>;
+  const out: Array<{ tMs: number; name: string }> = [];
+  for (const [, fields] of entries) {
+    const obj: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i += 2) obj[fields[i]] = fields[i + 1];
+    if (!obj.name) continue;
+    const tMs = Number(obj.tMs);
+    if (!Number.isFinite(tMs)) continue;
+    out.push({ tMs, name: obj.name });
+  }
+  return out;
+}
+
+async function readSessionStartedAt(pg: Pool, sessionId: string): Promise<number> {
+  const { rows } = await pg.query<{ started_at: Date | null }>(
+    `SELECT started_at FROM sessions WHERE id = $1`,
+    [sessionId]
+  );
+  const ts = rows[0]?.started_at;
+  if (ts instanceof Date) return ts.getTime();
+  // Fallback: "now" — loses absolute alignment but still yields a sane,
+  // monotonic coord system for events drained from the stream.
+  return Date.now();
+}
+
+function toCallRelSec(tMs: number, startedAtMs: number): number {
+  return (tMs - startedAtMs) / 1000;
 }
 
 async function drainCaptionStream(
@@ -440,3 +481,4 @@ function fmt(sec: number): string {
   const s = Math.floor(sec % 60);
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
+

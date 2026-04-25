@@ -13,6 +13,8 @@ export interface TranscribeChunkInput {
   apiKey: string;
   language?: string;
   model?: string;
+  /** Only used for `saaras:*` models: transcribe | translate | codemix | verbatim | translit. */
+  mode?: string;
 }
 
 export interface TranscribedSegment {
@@ -34,9 +36,14 @@ export async function transcribeChunk(
     new Blob([input.wavBuffer], { type: "audio/wav" }),
     `chunk_${String(input.chunkIdx).padStart(5, "0")}.wav`
   );
-  form.append("model", input.model ?? "saarika:v2.5");
+  const model = input.model ?? "saaras:v2.5";
+  form.append("model", model);
   form.append("language_code", input.language ?? "unknown");
   form.append("with_timestamps", "true");
+  // `mode` only applies to the saaras family. Quietly skip for saarika.
+  if (input.mode && model.startsWith("saaras")) {
+    form.append("mode", input.mode);
+  }
 
   const res = await fetch(SARVAM_ENDPOINT, {
     method: "POST",
@@ -53,17 +60,25 @@ export async function transcribeChunk(
 
   const json = (await res.json()) as {
     transcript?: string;
-    words?: Array<{ word: string; start_time?: number; end_time?: number }>;
+    timestamps?: {
+      words?: string[];
+      start_time_seconds?: number[];
+      end_time_seconds?: number[];
+    };
     language_code?: string;
     request_id?: string;
   };
 
   const chunkOffsetSec = input.chunkIdx * 30; // keep consistent with bot's chunkSeconds
 
-  if (json.words?.length) {
-    // Group words into ~1.5s utterance windows so segment rows aren't
-    // per-word spam, but still fine-grained enough for reconciliation.
-    return groupWords(json.words, chunkOffsetSec, requestId || json.request_id || "");
+  const ts = json.timestamps;
+  if (ts?.words?.length && ts.start_time_seconds?.length === ts.words.length) {
+    const words = ts.words.map((w, i) => ({
+      word: w,
+      start_time: ts.start_time_seconds![i],
+      end_time: ts.end_time_seconds?.[i] ?? ts.start_time_seconds![i],
+    }));
+    return groupWords(words, chunkOffsetSec, requestId || json.request_id || "");
   }
 
   const text = (json.transcript ?? "").trim();

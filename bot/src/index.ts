@@ -8,11 +8,13 @@ import { startAudioCapture } from "./audio.js";
 import type { AudioCaptureHandle } from "./audio.js";
 import { attachCaptionObserver } from "./captions.js";
 import type { CaptionObserverHandle } from "./captions.js";
+import { startActiveSpeakerPoller } from "./activeSpeaker.js";
+import type { ActiveSpeakerHandle } from "./activeSpeaker.js";
 import { scrapeRoster } from "./peoplePanel.js";
 import { dumpMeetDom } from "./debug.js";
 import { waitForCallEnd } from "./endDetect.js";
 import { selectors } from "./selectors.js";
-import { createRedis, pushCaption, setRoster, startHeartbeat } from "./state.js";
+import { createRedis, pushActiveSpeaker, pushCaption, setRoster, startHeartbeat } from "./state.js";
 
 const log = pino({ name: "bot", level: process.env.LOG_LEVEL ?? "info" });
 
@@ -47,20 +49,30 @@ async function main() {
   let joined: JoinResult | null = null;
   let audio: AudioCaptureHandle | null = null;
   let captions: CaptionObserverHandle | null = null;
+  let activeSpeaker: ActiveSpeakerHandle | null = null;
 
   // Read Meet's participant count via the "people" button's aria-label.
   // Returns the total participant count (including the bot) or null if the
   // button isn't reachable. Worker subtracts 1 for the bot itself.
   async function readParticipantCount(): Promise<number | null> {
     if (!joined) return null;
+    const handles = await joined.page
+      .locator(selectors.peoplePanelButton)
+      .elementHandles()
+      .catch(() => []);
     try {
-      const btn = joined.page.locator(selectors.participantCountButton).first();
-      if (!(await btn.isVisible().catch(() => false))) return null;
-      const aria = (await btn.getAttribute("aria-label").catch(() => "")) ?? "";
-      const m = aria.match(/(\d+)/);
-      return m ? Number(m[1]) : null;
-    } catch {
+      for (const h of handles) {
+        if (!(await h.isVisible().catch(() => false))) continue;
+        const aria = ((await h.getAttribute("aria-label").catch(() => null)) ?? "").trim();
+        const m = aria.match(/(\d+)/);
+        if (m) return Number(m[1]);
+        const txt = ((await h.textContent().catch(() => null)) ?? "").trim();
+        const tm = txt.match(/(\d+)/);
+        if (tm) return Number(tm[1]);
+      }
       return null;
+    } finally {
+      for (const h of handles) await h.dispose().catch(() => {});
     }
   }
 
@@ -90,16 +102,53 @@ async function main() {
     }
   };
 
-  const shutdown = async (sig: string, code = 0) => {
-    log.info({ sig }, "bot: shutting down");
-    // If we got a signal while in a call, still enqueue finalize so audio
-    // chunks we already pushed don't orphan.
-    if (joined && !finalizeEnqueued) {
-      await enqueueFinalize(`shutdown:${sig}`);
+  // Wait for every transcribe-chunk job we've pushed to reach a terminal
+  // state (completed or failed). Without this, the tail chunks race against
+  // finalize and get dropped from the transcript.
+  const drainTranscribeQueue = async (deadlineMs: number): Promise<void> => {
+    const deadline = Date.now() + deadlineMs;
+    const sessionPrefix = `${cfg.SESSION_ID}-chunk-`;
+    while (Date.now() < deadline) {
+      const [waiting, active, delayed] = await Promise.all([
+        transcribeQueue.getWaiting(0, -1).catch(() => []),
+        transcribeQueue.getActive(0, -1).catch(() => []),
+        transcribeQueue.getDelayed(0, -1).catch(() => []),
+      ]);
+      const pending = [...waiting, ...active, ...delayed].filter((j) =>
+        typeof j.id === "string" && j.id.startsWith(sessionPrefix)
+      );
+      if (pending.length === 0) {
+        log.info("transcribe queue drained for session");
+        return;
+      }
+      log.info({ pending: pending.length }, "waiting for transcribe-chunk jobs");
+      await new Promise((r) => setTimeout(r, 1_000));
     }
+    log.warn({ deadlineMs }, "transcribe-queue drain deadline hit; continuing anyway");
+  };
+
+  const shutdown = async (sig: string, code = 0, endSignal?: string) => {
+    log.info({ sig, endSignal }, "bot: shutting down");
     heartbeat.stop();
-    if (captions) await captions.stop().catch((err) => log.error({ err }, "captions stop"));
+    // Flush ffmpeg + upload tail chunks BEFORE touching finalize so no audio
+    // gets orphaned. captions + active-speaker observers stop in parallel —
+    // they're cheap.
+    const captionsStop = captions
+      ? captions.stop().catch((err) => log.error({ err }, "captions stop"))
+      : Promise.resolve();
+    const activeSpeakerStop = activeSpeaker
+      ? activeSpeaker.stop().catch((err) => log.error({ err }, "active-speaker stop"))
+      : Promise.resolve();
     if (audio) await audio.stop().catch((err) => log.error({ err }, "audio stop"));
+    await captionsStop;
+    await activeSpeakerStop;
+    // Wait for tail transcribe-chunk jobs to finish so finalize sees
+    // transcript_segments for every chunk we uploaded.
+    if (joined) await drainTranscribeQueue(45_000);
+    // Now safe to finalize.
+    if (joined && !finalizeEnqueued) {
+      await enqueueFinalize(endSignal ?? `shutdown:${sig}`);
+    }
     if (joined) await leaveMeet(joined).catch((err) => log.error({ err }, "leave"));
     await transcribeQueue.close().catch(() => {});
     await redis.quit().catch(() => {});
@@ -133,6 +182,12 @@ async function main() {
       )
     );
 
+    activeSpeaker = await startActiveSpeakerPoller(joined.page, (ev) =>
+      pushActiveSpeaker(redis, cfg.SESSION_ID!, ev).catch((err) =>
+        log.error({ err }, "pushActiveSpeaker failed")
+      )
+    );
+
     // t+8s: scrape the People panel for the human roster, and dump a DOM
     // diagnostic in parallel. Both run once, tolerate failure, and never
     // block call watching. Output at /chunks/debug_dom.json — `docker cp`
@@ -160,8 +215,7 @@ async function main() {
       hardTimeoutMs: cfg.CALL_HARD_TIMEOUT_MS,
     });
     log.info({ endSignal }, "bot: call ended");
-    await enqueueFinalize(endSignal);
-    await shutdown("END_SIGNAL");
+    await shutdown("END_SIGNAL", 0, endSignal);
   } catch (err) {
     log.error({ err }, "bot: fatal during boot");
     await shutdown("ERROR", 1);

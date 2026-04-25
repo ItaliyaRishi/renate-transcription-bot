@@ -119,6 +119,10 @@ services:
       dockerfile: bot/Dockerfile
     image: renate-bot:latest
     env_file: .env
+    # SIGTERM shutdown flushes ffmpeg, waits for all transcribe-chunk jobs
+    # to drain, then enqueues finalize. Worst case: last chunk (~30s audio)
+    # + sarvam round-trip (~10s) + diarize queue wait. 60s leaves headroom.
+    stop_grace_period: 60s
     volumes:
       - ./auth:/auth:ro
     networks: [renate]

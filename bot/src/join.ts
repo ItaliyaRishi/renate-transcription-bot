@@ -36,6 +36,14 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
       "--disable-dev-shm-usage",
       "--autoplay-policy=no-user-gesture-required",
       "--disable-gpu",
+      // Keep the Meet tab's renderer alive while the bot sits idle. Without
+      // these, Chromium throttles background timers ~5 min in and the
+      // WebRTC-to-PulseAudio path starves — we saw digital silence in
+      // chunks 12-38 of session fc7b1ae1.
+      "--disable-background-media-suspend",
+      "--disable-renderer-backgrounding",
+      "--disable-background-timer-throttling",
+      "--disable-features=IntensiveWakeUpThrottling,CalculateNativeWinOcclusion",
     ],
   });
 

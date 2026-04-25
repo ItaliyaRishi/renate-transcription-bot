@@ -1,0 +1,14 @@
+TIME            SPEAKER              TEXT
+------------------------------------------------------------
+[300.00s-417.95s] Rishi Italiya:     This is a laptop. Hello, am I audible? Am I audible, mister? Am I audible, mister? Hi, hi, hi. Hi, how are you? Yeah, I'm fine. Let's start with the basic questions. Sorry. What is Renet's primary function in the hiring process? Yeah, so Renet's primary function is to Renet give job or exposition while recruiting agent volume is exploding. listed application, how Renet works. So you submit a job, Renet takes it from there. Here is exactly what happens. We go to Totos and then Irish and one agent the whole job. You fill out a form, okay, got it? Let's move on. What's your plan on Saturday?
+
+[420.00s-447.96s] Mandar Surve:      My plan is what changes for the recruiter. So active sourcing. Renate find candidates for you. Your pipeline isn't limited to whoever saw the job post. Full audit trial. Every decision Rishi makes, Mandar can sit. From first score to final summary. . Okay. So how does Renate handle?
+
+[450.00s-507.95s] Rishi Italiya:     both inbound applicants and passive talent. The four state scoring pipeline. Parsing and normalization. Are we getting. Okay, go ahead. What information is included? What information is included in the intelligence package generated after a voice call? Renit is an AI agent that sources Candidates screen resumes, conduct voice interviews, and deliver a short list of verified evidence-backed hires autonomously. What do you do for a living? What do you do for a living? Okay. During the call, Renit builds rapport and explains the process naturally. So, I do this.
+
+[510.00s-537.95s] Mandar Surve:      Hmm. So, if the questions are done, we will discuss together. Uh, no. Okay. Then what should we do? One more question. One more question, Rishi. Yes. What is your name? My name is Ranit. And hello, recruiter.
+
+[540.00s-567.96s] Rishi Italiya:     What are your thoughts? My thought is one agent the whole job. Who is Vignesh? So sir, will you hire me or not? Interesting. I don't think so I can hire you right now, but
+
+[570.00s-627.95s] Unknown:           What are your thoughts, sir? I don't think you are capable of even talking to me, so you should just leave this meeting right now. Okay, sir. It was nice talking to you. Don't call from now on. Okay, go then. Bye. Without that.
+

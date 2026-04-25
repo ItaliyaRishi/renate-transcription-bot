@@ -25,9 +25,10 @@ export const selectors = {
   // join-success signal.
   leaveCallButton: 'button[aria-label="Leave call"]',
 
-  // End-of-call signals (Phase 6 — but kept here for the single-file promise).
-  aloneBannerText: "You're the only one here",
-  participantCountButton: 'button[aria-label*="people" i]',
+  // End-of-call detection now goes through peoplePanelButton (below) — we
+  // read the count from its aria-label without opening the side panel. The
+  // previous locale-dependent text banner and narrow "people" selector
+  // proved unreliable.
 
   // --- Captions ---
   // aria-label for the CC toggle contains "captions" (sometimes with
@@ -65,6 +66,22 @@ export const selectors = {
   // Each roster row. Meet renders them as [role="listitem"] within the panel;
   // display name lives in a nested span. Fall back to common class names.
   peoplePanelRosterItem: '[role="listitem"][aria-label], div[data-participant-id]',
+
+  // --- Active-speaker tile ---
+  // Main-stage container that wraps the grid/speaker view. The poller scopes
+  // its tile search to this to avoid picking up preview thumbnails.
+  activeStageContainer:
+    '[data-allocation-index], [jsname="A5il2e"], main [role="main"], [role="main"]',
+
+  // Any element that could be a participant tile. First match wins across
+  // the three strategies in `activeSpeaker.ts`; order them cheapest-first.
+  activeTileCandidates:
+    '[data-participant-id], [data-self-name], [data-requested-participant-id], [class*="participant-tile"]',
+
+  // Within a tile, where the displayName label tends to live. Meet's tile
+  // bottom-left shows name + mic status; the shortest non-empty text node
+  // inside these matches the name robustly even as Google renames classes.
+  activeTileNameLabel: '[data-self-name], [jsname*="A5il2e"] span, span',
 } as const;
 
 export type SelectorKey = keyof typeof selectors;

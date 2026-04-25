@@ -53,16 +53,100 @@ async function openPanel(page: Page): Promise<boolean> {
 async function extractNames(page: Page): Promise<string[]> {
   return page
     .evaluate((sel: string) => {
+      // aria-label on the [role="listitem"] in modern Meet is polluted:
+      //   "keep_outlinePin <Name> to your main screen…<Name> <Name> devices"
+      // Strategy:
+      //   1. Prefer an inner <span> whose text is a plausible human name
+      //      (non-empty, no icon ligatures, not starting with "keep_outline"
+      //      or other Material-icon glyphs).
+      //   2. If multiple spans match, pick the shortest non-empty one —
+      //      it's almost always the name (vs menu-button labels).
+      //   3. Fall back to the longest repeated substring in the aria-label
+      //      (the real name appears 2-3× in the polluted label).
+      const NOISE_PREFIXES = [
+        "keep_outline", "more_vert", "mic_off", "mic_on", "videocam",
+        "present_to_all", "volume", "spatial_audio",
+        "remove", "mute", "unmute", "pin", "unpin", "present",
+      ];
+      const ACTION_PHRASES = /\bthis (tile|call|person)\b/i;
+      const looksLikeName = (s: string): boolean => {
+        if (!s) return false;
+        if (s.length > 60) return false;
+        const low = s.toLowerCase();
+        if (NOISE_PREFIXES.some((p) => low.startsWith(p))) return false;
+        if (/^(devices?|menu|options|more|pin|unpin|remove|mute)$/i.test(s.trim())) return false;
+        if (ACTION_PHRASES.test(s)) return false;
+        // must contain at least one letter
+        if (!/[a-z]/i.test(s)) return false;
+        return true;
+      };
+
+      // Scope to the participants-panel container when we can find it.
+      // Without this, a listitem inside a tile's "⋮" action sub-menu
+      // ("Remove this tile") leaks into the roster.
+      function findPanel(): ParentNode {
+        const byAria = document.querySelector(
+          '[aria-label*="articipants" i][role], [aria-label*="eople" i][role]'
+        );
+        if (byAria) return byAria;
+        const complementary = document.querySelector('[role="complementary"]');
+        if (complementary) return complementary;
+        return document;
+      }
+      const scope = findPanel();
+
+      const isActionMenuItem = (el: Element): boolean => {
+        if (el.getAttribute("role") === "menuitem") return true;
+        return el.closest('[role="menu"]') !== null;
+      };
+
       const out: string[] = [];
-      const items = document.querySelectorAll(sel);
+      const items = scope.querySelectorAll(sel);
+      // Spans inside a button / role=button are action-button labels (e.g.
+      // "Show in a tile", "Pin to your screen") — never the participant's
+      // display name. Skip them so action labels don't end up in the roster.
+      const isInsideButton = (el: Element): boolean => {
+        return el.closest('button, [role="button"]') !== null;
+      };
       items.forEach((el) => {
-        const aria = (el.getAttribute("aria-label") ?? "").trim();
-        if (aria) {
-          out.push(aria);
+        if (isActionMenuItem(el)) return;
+        // 1) Best: find a clean inner span that isn't inside a button.
+        const spans = Array.from(el.querySelectorAll("span"))
+          .filter((s) => !isInsideButton(s));
+        const candidates = spans
+          .map((s) => (s.textContent ?? "").trim())
+          .filter(looksLikeName);
+        if (candidates.length) {
+          // shortest likely = the bare name
+          candidates.sort((a, b) => a.length - b.length);
+          out.push(candidates[0]);
           return;
         }
-        const text = (el.textContent ?? "").trim().split("\n")[0]?.trim() ?? "";
-        if (text) out.push(text);
+        // 2) Fallback: longest repeated token run inside aria-label.
+        const aria = (el.getAttribute("aria-label") ?? "").trim();
+        if (aria) {
+          const tokens = aria.split(/\s+/).filter(Boolean);
+          const counts = new Map<string, number>();
+          tokens.forEach((t) => counts.set(t, (counts.get(t) ?? 0) + 1));
+          // Find consecutive runs of repeated tokens — names repeat as
+          // "Rishi Italiya Rishi Italiya" inside the polluted label.
+          for (let i = 0; i < tokens.length; i++) {
+            const t = tokens[i];
+            if ((counts.get(t) ?? 0) >= 2 && looksLikeName(t)) {
+              // Try to greedily extend with the next repeated token.
+              const next = tokens[i + 1];
+              const full =
+                next && (counts.get(next) ?? 0) >= 2 && looksLikeName(next)
+                  ? `${t} ${next}`
+                  : t;
+              out.push(full);
+              return;
+            }
+          }
+          // 3) Last resort: first line of textContent.
+          const text = (el.textContent ?? "").trim().split("\n")[0]?.trim() ?? "";
+          if (looksLikeName(text)) out.push(text);
+        }
       });
       return out;
     }, selectors.peoplePanelRosterItem)

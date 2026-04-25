@@ -83,9 +83,15 @@ async function main() {
           s3Key,
           wavBuffer: wav,
           apiKey: cfg.SARVAM_API_KEY,
+          model: cfg.SARVAM_MODEL,
+          language: cfg.SARVAM_LANGUAGE_CODE,
+          mode: cfg.SARVAM_MODE,
         });
         await insertTranscriptSegments(pg, sessionId, chunkIdx, segments);
-        jobLog.info({ segments: segments.length }, "done");
+        jobLog.info(
+          { segments: segments.length, model: cfg.SARVAM_MODEL, mode: cfg.SARVAM_MODE },
+          "done"
+        );
       },
       { connection, concurrency: 3 }
     ),

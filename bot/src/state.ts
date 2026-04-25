@@ -34,6 +34,21 @@ export async function setRoster(
   await redis.set(key, JSON.stringify(names), "EX", 86_400);
 }
 
+export async function pushActiveSpeaker(
+  redis: Redis,
+  sessionId: string,
+  ev: { tMs: number; name: string }
+): Promise<void> {
+  const key = `active_speaker:${sessionId}`;
+  await redis.xadd(
+    key,
+    "MAXLEN", "~", "50000",
+    "*",
+    "name", ev.name,
+    "tMs", String(ev.tMs)
+  );
+}
+
 export interface HeartbeatHandle {
   stop(): void;
 }

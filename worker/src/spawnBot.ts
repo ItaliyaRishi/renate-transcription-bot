@@ -45,6 +45,9 @@ export async function spawnBot(input: SpawnBotInput): Promise<SpawnBotResult> {
   const container = await docker.createContainer({
     name,
     Image: input.image,
+    // SIGTERM grace: shutdown flushes ffmpeg, drains transcribe-chunk queue
+    // (up to 45s), enqueues finalize. 60s headroom.
+    StopTimeout: 60,
     Env: Object.entries({
       ...input.env,
       SESSION_ID: input.sessionId,

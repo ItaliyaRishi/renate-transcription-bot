@@ -16,8 +16,12 @@ export async function dumpMeetDom(
   outPath = "/chunks/debug_dom.json"
 ): Promise<void> {
   try {
+    // Passing the function reference (not an arrow wrapper) lets Playwright
+    // serialize collectDomEvidence into the page context. Wrapping it in a
+    // closure instead fails with `ReferenceError: collectDomEvidence is not
+    // defined` — the wrapper captures the Node-side name.
     const [pageSnapshot, a11yTree] = await Promise.all([
-      page.evaluate(() => collectDomEvidence()),
+      page.evaluate(collectDomEvidence),
       page.accessibility.snapshot({ interestingOnly: false }).catch(() => null),
     ]);
 
