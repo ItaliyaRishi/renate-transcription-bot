@@ -42,7 +42,13 @@ export async function attachCaptionObserver(
     log.info({ firstCaptionDom: String(payload) }, "first-caption-dom");
   });
 
-  await enableCaptions(page);
+  // Fire-and-forget: keep trying to enable captions for the entire call.
+  // The MutationObserver below polls for the caption container, so it
+  // attaches the moment captions start flowing — even if enable succeeds
+  // 30 minutes into the call.
+  void enableCaptions(page).catch((err) =>
+    log.error({ err }, "enableCaptions loop crashed")
+  );
 
   await page.evaluate(
     ({ containerSel, speakerBadgeSel, textNodeSel }) => {
@@ -238,23 +244,20 @@ export async function attachCaptionObserver(
 }
 
 async function enableCaptions(page: Page): Promise<void> {
-  // Enable captions deterministically: find the toggle button by aria-label,
-  // click it if it says "Turn on captions", then VERIFY the caption container
-  // actually renders. Retry up to 3× with 3s backoff. No keyboard fallback —
-  // the global 'c' shortcut silently no-ops when the meeting view doesn't
-  // have keyboard focus (which is almost always in a just-joined Playwright
-  // page) and masks failures.
-  const MAX_ATTEMPTS = 3;
-  const BACKOFF_MS = 3_000;
-  const VERIFY_TIMEOUT_MS = 10_000;
+  // Try to enable captions for the duration of the call. If the bot joins
+  // before any humans, Meet's bottom toolbar can be in a half-rendered
+  // empty-call state and the CC button isn't selectable. Earlier versions
+  // gave up after 3 attempts in 12s — fatal when the host joins later. Now
+  // we retry forever (until verified or shutdown) at a slow cadence so the
+  // observer attaches the moment Meet first exposes the button.
+  const BACKOFF_MS = 5_000;
+  const VERIFY_TIMEOUT_MS = 8_000;
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     if (attempt > 1) await page.waitForTimeout(BACKOFF_MS);
 
-    // Meet auto-hides the bottom toolbar after ~3s of no mouse movement.
-    // Headful Chromium via Playwright rarely generates synthetic mouse
-    // events, so the CC button stays hidden and our selector misses. Nudge
-    // the mouse into the meeting canvas to force the toolbar to render.
+    // Meet auto-hides the toolbar after ~3s of no mouse activity. Nudge
+    // the cursor before each retry so the CC button is actually visible.
     await revealToolbar(page).catch(() => {});
 
     const candidates = await page
@@ -296,13 +299,10 @@ async function enableCaptions(page: Page): Promise<void> {
       continue;
     }
 
-    log.warn({ attempt }, "captions toggle button not found; retrying");
+    if (attempt === 1 || attempt % 6 === 0) {
+      log.warn({ attempt }, "captions toggle button not found; will keep retrying");
+    }
   }
-
-  log.error(
-    { attempts: MAX_ATTEMPTS },
-    "captions enablement FAILED: toggle not found or container never rendered — downstream name attribution will fall back to roster"
-  );
 }
 
 // Meet hides the bottom toolbar (CC toggle, mic, cam, leave) after a few
