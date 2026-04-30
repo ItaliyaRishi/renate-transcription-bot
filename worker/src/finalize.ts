@@ -9,7 +9,6 @@ import type { S3Client } from "@aws-sdk/client-s3";
 import pino from "pino";
 import { getAudioChunk, putAudioChunk } from "./s3.js";
 import {
-  mergeSegmentsWithSpeakers,
   resolveClusterNames,
   type DomCaptionRecord,
   type NameEvent,
@@ -21,6 +20,8 @@ import {
   updateSessionStatus,
   writeFinalTranscript,
 } from "./persist.js";
+import { alignWordsToTurns, type Word } from "./turnAlign.js";
+import { renderTranscript, type FinalRow } from "./renderTranscript.js";
 import { summarize } from "./summarize.js";
 
 const log = pino({ name: "worker.finalize", level: process.env.LOG_LEVEL ?? "info" });
@@ -152,13 +153,29 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
     })),
   ];
 
-  const { clusterToName: speakerMap, resolution } = resolveClusterNames(
+  const { clusterToName: speakerMap, resolution, weightMatrix } = resolveClusterNames(
     turns,
     nameEvents,
     roster.names
   );
+  const numClusters = Object.keys(speakerMap).length;
+  const numAssignedNames = Object.values(resolution).filter(
+    (r) => r === "caption" || r === "tile"
+  ).length;
+  const numFallbackNames = Object.values(resolution).filter(
+    (r) => r === "fallback"
+  ).length;
   log.info(
-    { sessionId, speakerMap, resolution, rosterSource: roster.source },
+    {
+      sessionId,
+      speakerMap,
+      resolution,
+      rosterSource: roster.source,
+      numClusters,
+      numAssignedNames,
+      numFallbackNames,
+      weightMatrix,
+    },
     "speaker map"
   );
 
@@ -174,16 +191,48 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
     }))
   );
 
-  // 5) Pull transcript_segments, merge with speakers, and write transcript_final.
-  const segs = await loadSegments(pg, sessionId);
-  log.info({ sessionId, segs: segs.length }, "segments loaded");
+  // 5) Pull transcript_segments + word timings, then build transcript_final
+  // ROW-PER-DIARIZE-TURN. This preserves rapid back-and-forth: a one-word
+  // interjection that cuts another speaker off lands as its own row,
+  // because diarize already produced an A→B→A turn list.
+  const { segments: segs, words } = await loadSegmentsAndWords(pg, sessionId);
+  log.info(
+    { sessionId, segs: segs.length, words: words.length },
+    "segments + words loaded"
+  );
 
-  let finalRows: Array<{ startTs: number; endTs: number; speakerName: string; text: string }>;
-  if (turns.length) {
-    finalRows = mergeSegmentsWithSpeakers(segs, turns, speakerMap);
+  let finalRows: Array<{
+    startTs: number;
+    endTs: number;
+    speakerName: string;
+    text: string;
+    cluster: string | null;
+  }>;
+  if (turns.length && words.length) {
+    const aligned = alignWordsToTurns(words, turns);
+    finalRows = aligned.map((r) => ({
+      startTs: r.startTs,
+      endTs: r.endTs,
+      speakerName: speakerMap[r.cluster] ?? r.cluster,
+      text: r.text,
+      cluster: r.cluster,
+    }));
+  } else if (turns.length) {
+    // Sarvam returned no per-word timings — degrade to per-segment overlap
+    // with diarize turns. Still one row per segment, no merging.
+    finalRows = segs.map((s) => {
+      const best = pickBestTurnOverlap(s.startTs, s.endTs, turns);
+      return {
+        startTs: s.startTs,
+        endTs: s.endTs,
+        speakerName: best ? speakerMap[best.cluster] ?? best.cluster : "Unknown",
+        text: s.text,
+        cluster: best?.cluster ?? null,
+      };
+    });
   } else {
-    // Graceful degrade: no diarization → attribute each Sarvam segment to
-    // the caption row whose interval overlaps it most.
+    // No diarization at all → attribute each Sarvam segment to the caption
+    // row whose interval overlaps it most.
     finalRows = segs.map((s) => {
       const best = pickOverlap(s.startTs, s.endTs, captions);
       return {
@@ -191,18 +240,26 @@ export async function finalizeSession(input: FinalizeInput): Promise<void> {
         endTs: s.endTs,
         speakerName: best?.speakerName ?? "Unknown",
         text: s.text,
+        cluster: null,
       };
     });
   }
   await writeFinalTranscript(pg, sessionId, finalRows);
 
-  // 6) Summarize and store on sessions.summary_md.
+  // 6) Render transcript in user-spec format and feed to OpenAI.
+  const startedAtDate = startedAtMs ? new Date(startedAtMs) : null;
+  const renderRows: FinalRow[] = finalRows.map((r) => ({
+    startTs: r.startTs,
+    endTs: r.endTs,
+    speakerName: r.speakerName,
+    text: r.text,
+  }));
+  const transcriptText = renderTranscript(renderRows, startedAtDate);
   let summaryMd: string | undefined;
   try {
-    const transcriptMd = renderTranscriptMarkdown(finalRows);
     summaryMd = await summarize({
       sessionId,
-      transcriptMarkdown: transcriptMd,
+      transcriptMarkdown: transcriptText,
       apiKey: openaiApiKey,
     });
   } catch (err) {
@@ -435,22 +492,54 @@ async function callDiarize(
   }));
 }
 
-async function loadSegments(
+async function loadSegmentsAndWords(
   pg: Pool,
   sessionId: string
-): Promise<Array<{ startTs: number; endTs: number; text: string }>> {
-  const { rows } = await pg.query<{ start_ts: string; end_ts: string; raw_text: string }>(
-    `SELECT start_ts, end_ts, raw_text
+): Promise<{
+  segments: Array<{ startTs: number; endTs: number; text: string }>;
+  words: Word[];
+}> {
+  const { rows } = await pg.query<{
+    start_ts: string;
+    end_ts: string;
+    raw_text: string;
+    words: unknown;
+  }>(
+    `SELECT start_ts, end_ts, raw_text, words
        FROM transcript_segments
       WHERE session_id = $1
       ORDER BY start_ts ASC`,
     [sessionId]
   );
-  return rows.map((r) => ({
+  const segments = rows.map((r) => ({
     startTs: Number(r.start_ts),
     endTs: Number(r.end_ts),
     text: r.raw_text,
   }));
+  const words: Word[] = [];
+  for (const r of rows) {
+    if (!Array.isArray(r.words)) continue;
+    for (const w of r.words as Array<{ startTs?: number; endTs?: number; text?: string }>) {
+      if (typeof w?.startTs !== "number" || typeof w?.endTs !== "number" || !w.text) continue;
+      words.push({ startTs: w.startTs, endTs: w.endTs, text: String(w.text) });
+    }
+  }
+  return { segments, words };
+}
+
+function pickBestTurnOverlap(
+  segStart: number,
+  segEnd: number,
+  turns: PyannoteTurn[]
+): PyannoteTurn | null {
+  let best: { turn: PyannoteTurn; o: number } | null = null;
+  for (const t of turns) {
+    const s = Math.max(segStart, t.startTs);
+    const e = Math.min(segEnd, t.endTs);
+    const o = Math.max(0, e - s);
+    if (o > 0 && (!best || o > best.o)) best = { turn: t, o };
+  }
+  return best?.turn ?? null;
 }
 
 function pickOverlap(
@@ -468,17 +557,4 @@ function pickOverlap(
   return best?.c ?? null;
 }
 
-function renderTranscriptMarkdown(
-  rows: Array<{ startTs: number; endTs: number; speakerName: string; text: string }>
-): string {
-  return rows
-    .map((r) => `**${r.speakerName}** (${fmt(r.startTs)} → ${fmt(r.endTs)}): ${r.text}`)
-    .join("\n");
-}
-
-function fmt(sec: number): string {
-  const m = Math.floor(sec / 60);
-  const s = Math.floor(sec % 60);
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
 

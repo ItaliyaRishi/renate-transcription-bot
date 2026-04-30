@@ -17,9 +17,20 @@ export const selectors = {
   preJoinCamToggle: '[aria-label*="camera" i][role="button"]',
 
   // Join button. Workspace meetings show "Join now" for invited attendees,
-  // "Ask to join" for knock-to-join. We try both.
-  joinNowButton: 'button:has-text("Join now")',
-  askToJoinButton: 'button:has-text("Ask to join")',
+  // "Ask to join" for knock-to-join. We try both. Meet historically wraps
+  // the clickable surface as `<button>` but ships some flows with
+  // `<div role="button">`, so match either.
+  joinNowButton:
+    'button:has-text("Join now"), [role="button"]:has-text("Join now")',
+  askToJoinButton:
+    'button:has-text("Ask to join"), [role="button"]:has-text("Ask to join")',
+  // Shown when the same Google account is already in another active call.
+  // Clicking it hands the bot off to the new meeting cleanly — Meet treats
+  // it as moving the call between devices, no "Ask to join" gate. Meet
+  // renders this with `<div role="button">` (not `<button>`), so we must
+  // include the role-based variant.
+  switchHereButton:
+    'button:has-text("Switch here"), [role="button"]:has-text("Switch here"), [aria-label*="switch here" i]',
 
   // Post-join: the persistent "Leave call" button. This is the most reliable
   // join-success signal.
@@ -63,6 +74,15 @@ export const selectors = {
   // Close-panel control when the side panel is open.
   peoplePanelCloseButton: 'button[aria-label*="close" i]',
 
+  // Live-roster MutationObserver target. Vexa + meetingbot 2026 both
+  // confirm Meet renders the participants side panel under
+  // `[aria-label="Participants"]` (case-insensitive locale variants too).
+  // We attach a MutationObserver here and never close it for the call
+  // duration — every joiner / leaver fires childList mutations, including
+  // silent participants who never appear in the captions stream.
+  peoplePanelContainer:
+    '[aria-label="Participants" i], [aria-label*="articipants" i][role]',
+
   // Each roster row. Meet renders them as [role="listitem"] within the panel;
   // display name lives in a nested span. Fall back to common class names.
   peoplePanelRosterItem: '[role="listitem"][aria-label], div[data-participant-id]',
@@ -73,10 +93,18 @@ export const selectors = {
   activeStageContainer:
     '[data-allocation-index], [jsname="A5il2e"], main [role="main"], [role="main"]',
 
-  // Any element that could be a participant tile. First match wins across
-  // the three strategies in `activeSpeaker.ts`; order them cheapest-first.
-  activeTileCandidates:
-    '[data-participant-id], [data-self-name], [data-requested-participant-id], [class*="participant-tile"]',
+  // Semantic active-speaker signal: tiles carry `data-audio-level` whose
+  // value is non-zero while audio level > 0. Vexa-confirmed selector that
+  // survives Meet's CSS-class rotation. Tiles also carry
+  // `data-requested-participant-id` so we can join to the People-panel
+  // roster directly without scraping the tile's name label.
+  activeTileCandidates: '[data-audio-level]',
+
+  // Fallback selectors for the rare case data-audio-level isn't emitted.
+  // Class tokens rotate quarterly per public reverse-engineering reports;
+  // treat as opportunistic only.
+  activeTileFallback:
+    '[data-participant-id], [data-self-name], [data-requested-participant-id]',
 
   // Within a tile, where the displayName label tends to live. Meet's tile
   // bottom-left shows name + mic status; the shortest non-empty text node

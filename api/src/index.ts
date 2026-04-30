@@ -55,7 +55,23 @@ app.get<{ Params: { id: string } }>("/sessions/:id", async (req, reply) => {
     [req.params.id]
   );
   if (!rows[0]) return reply.code(404).send({ error: "not_found" });
-  return rows[0];
+  const session = rows[0] as Record<string, unknown>;
+
+  // transcript_text is rendered straight from the transcript_final_rendered
+  // SQL view (started_at + start_ts → wall-clock in Asia/Kolkata, formatted
+  // as "[HH:MM AM/PM] Speaker: text"). Empty string while session is still
+  // pre-finalize. The view-side TZ matches worker/src/renderTranscript.ts so
+  // both surfaces render identically.
+  let transcriptText = "";
+  if (session.status === "complete") {
+    const lines = await pg.query<{ text_line: string }>(
+      `SELECT text_line FROM transcript_final_rendered
+        WHERE session_id = $1 ORDER BY start_ts ASC`,
+      [req.params.id]
+    );
+    transcriptText = lines.rows.map((r) => r.text_line).join("\n");
+  }
+  return { ...session, transcript_text: transcriptText };
 });
 
 async function start() {

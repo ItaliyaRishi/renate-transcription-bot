@@ -63,6 +63,30 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
     Object.defineProperty(navigator, "languages", {
       get: () => ["en-US", "en"],
     });
+
+    // Track every RTCPeerConnection so leaveMeet can close them explicitly.
+    // Without this, if the Leave-call button click misses (host-kicked, UI
+    // changed, race), the WebRTC session stays alive at the TURN/ICE layer
+    // for ~minutes — which makes Meet think the bot account is still in
+    // the prior call and shows "Switch here" on the next join.
+    const Native = (window as unknown as { RTCPeerConnection: typeof RTCPeerConnection })
+      .RTCPeerConnection;
+    if (Native) {
+      const registry: RTCPeerConnection[] = [];
+      const Patched = function (this: RTCPeerConnection, ...args: unknown[]) {
+        const pc = new (Native as unknown as new (...a: unknown[]) => RTCPeerConnection)(...args);
+        registry.push(pc);
+        return pc;
+      } as unknown as typeof RTCPeerConnection;
+      Patched.prototype = Native.prototype;
+      Object.defineProperty(window, "RTCPeerConnection", {
+        configurable: true,
+        writable: true,
+        value: Patched,
+      });
+      (window as unknown as { __renatePeerConnections: RTCPeerConnection[] })
+        .__renatePeerConnections = registry;
+    }
   });
 
   await context.grantPermissions(["microphone", "camera"], {
@@ -88,14 +112,43 @@ export async function joinMeet(opts: JoinOptions): Promise<JoinResult> {
       }
     }
 
-    // Click join. "Join now" (invited) beats "Ask to join" (knock) when both
-    // are present, but in practice only one is rendered.
-    const joinNow = page.locator(selectors.joinNowButton).first();
-    const askToJoin = page.locator(selectors.askToJoinButton).first();
-    const joinButton = (await joinNow.isVisible().catch(() => false)) ? joinNow : askToJoin;
+    // Race three possible join states. Whichever button appears first wins.
+    //   1. "Join now"    — invited / workspace member
+    //   2. "Switch here" — same Google account is already in another call;
+    //                       Meet offers a clean device handoff that bypasses
+    //                       the "Ask to join" gate. Common when a prior bot
+    //                       container exited without fully tearing down its
+    //                       WebRTC session.
+    //   3. "Ask to join" — knock-to-join, host must admit
+    type JoinKind = "joinNow" | "switchHere" | "askToJoin";
+    const candidates: Array<{ kind: JoinKind; selector: string }> = [
+      { kind: "joinNow", selector: selectors.joinNowButton },
+      { kind: "switchHere", selector: selectors.switchHereButton },
+      { kind: "askToJoin", selector: selectors.askToJoinButton },
+    ];
 
-    log.info("clicking join");
-    await joinButton.click({ timeout: joinTimeout });
+    const probe = async ({ kind, selector }: { kind: JoinKind; selector: string }) => {
+      await page
+        .locator(selector)
+        .first()
+        .waitFor({ state: "visible", timeout: joinTimeout });
+      return kind;
+    };
+
+    let joinKind: JoinKind;
+    try {
+      joinKind = await Promise.any(candidates.map(probe));
+    } catch {
+      // No join button appeared at all within joinTimeout.
+      throw new Error(
+        `no join button visible within ${joinTimeout}ms (none of joinNow/switchHere/askToJoin)`
+      );
+    }
+
+    const winningSelector = candidates.find((c) => c.kind === joinKind)!.selector;
+    const joinButton = page.locator(winningSelector).first();
+    log.info({ joinKind }, "clicking join");
+    await joinButton.click({ timeout: 10_000 });
 
     // Join success = "Leave call" button appears in the post-join UI.
     // For knock-to-join, this may take longer as host must admit; caller's
@@ -149,9 +202,44 @@ export async function leaveMeet(result: JoinResult): Promise<void> {
     if (await leave.isVisible().catch(() => false)) {
       log.info("clicking leave");
       await leave.click({ timeout: 10_000 }).catch(() => {});
-      // Give Meet a moment to record the leave event.
-      await result.page.waitForTimeout(500);
+      // Wait for Meet's "you left" landing OR the leave-call button to
+      // disappear, whichever comes first. Capped at 5s so a stuck UI
+      // doesn't hold the container open.
+      await Promise.race([
+        result.page
+          .waitForURL(/meet\.google\.com\/(landing|home|_meet)/i, { timeout: 5_000 })
+          .catch(() => {}),
+        result.page
+          .locator(selectors.leaveCallButton)
+          .waitFor({ state: "hidden", timeout: 5_000 })
+          .catch(() => {}),
+      ]);
     }
+
+    // Belt-and-suspenders: explicitly close every RTCPeerConnection the page
+    // ever opened. Even if the Leave click missed or fired before signaling
+    // could ack, this severs ICE and Meet's signaling layer drops the
+    // participant immediately. Without it, the bot's Google account can
+    // appear "still in another call" for several minutes on the next join.
+    await result.page
+      .evaluate(() => {
+        const w = window as unknown as { __renatePeerConnections?: RTCPeerConnection[] };
+        const conns = w.__renatePeerConnections ?? [];
+        let closed = 0;
+        for (const pc of conns) {
+          try {
+            pc.getSenders().forEach((s) => s.track?.stop());
+            pc.getReceivers().forEach((r) => r.track?.stop());
+            pc.close();
+            closed++;
+          } catch {
+            /* already closed */
+          }
+        }
+        return { tracked: conns.length, closed };
+      })
+      .then((stats) => log.info(stats, "peer connections closed"))
+      .catch((err) => log.warn({ err }, "peer-connection close failed"));
   } finally {
     await result.context.close().catch(() => {});
     await result.browser.close().catch(() => {});

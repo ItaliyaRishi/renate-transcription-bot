@@ -16,18 +16,21 @@ export interface ActiveSpeakerHandle {
   emitted(): number;
 }
 
-const POLL_MS = 200;
+const REPORT_DEBOUNCE_MS = 150;
+const SNAPSHOT_TIMEOUT_MS = 30_000;
 
 /**
- * Poll the Meet DOM at 5 Hz for the active-speaker tile. Meet highlights
- * the currently-speaking tile visually regardless of whether its own ASR
- * fires — crucial for Hindi / code-switch spans where the caption stream
- * is silent but audio is live.
+ * Watch Meet's main grid for the currently-speaking tile. Primary signal
+ * is the `data-audio-level` attribute on each tile (semantic; survives
+ * Meet's CSS-class rotation per Vexa's reverse-engineering reports). We
+ * read the speaker's name straight off the tile's
+ * `data-requested-participant-id` and the in-tile name label, with a
+ * fallback to obfuscated speaking-class tokens.
  *
- * Strategies tried in order (cheapest first):
- *   1. element with `data-active-speaker="true"` inside the stage
- *   2. tile whose border/outline/boxShadow is Meet accent blue
- *   3. first tile whose class list contains an "active" token
+ * Implementation: a single MutationObserver on the stage's subtree with
+ * `attributeFilter: ['data-audio-level']`. Far fewer wake-ups than the
+ * old 200 ms setInterval, and sub-100 ms latency between Meet flipping
+ * the tile and us pushing the event.
  */
 export async function startActiveSpeakerPoller(
   page: Page,
@@ -54,31 +57,18 @@ export async function startActiveSpeakerPoller(
   });
 
   await page.evaluate(
-    ({ stageSel, tileSel, nameSel, pollMs }) => {
-      // Heuristic for Meet's accent blue (≈ rgb(11, 87, 208) / #0b57d0).
-      // Tolerates minor shade drift across Meet themes.
-      function isAccentBlue(val: string): boolean {
-        const m = val.match(/rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
-        if (!m) return false;
-        const r = Number(m[1]);
-        const g = Number(m[2]);
-        const b = Number(m[3]);
-        return b > 150 && b > r + 50 && b > g + 40;
-      }
-
+    ({ stageSel, tileSel, fallbackTileSel, nameSel, debounceMs, snapshotTimeoutMs }) => {
       function clean(s: string | null | undefined): string {
         return (s ?? "").replace(/\s+/g, " ").trim();
       }
-
       function isNoise(s: string): boolean {
         if (!s) return true;
         if (s.length > 60) return true;
         if (/^(you|me|presenting|muted|unmuted)$/i.test(s)) return true;
-        if (/^\d{1,2}:\d{2}/.test(s)) return true; // call-duration ticker
+        if (/^\d{1,2}:\d{2}/.test(s)) return true;
         if (!/[a-z]/i.test(s)) return true;
         return false;
       }
-
       function findStage(): Element {
         for (const sel of stageSel.split(",").map((x: string) => x.trim())) {
           const el = document.querySelector(sel);
@@ -87,37 +77,58 @@ export async function startActiveSpeakerPoller(
         return document.body;
       }
 
-      function findActiveTile(stage: Element): Element | null {
-        // Strategy 1: explicit attribute, if Meet ever exposes it.
-        const explicit = stage.querySelector('[data-active-speaker="true"]');
-        if (explicit) return explicit;
-
-        const tiles = Array.from(stage.querySelectorAll(tileSel));
-
-        // Strategy 2: accent-blue border/outline/boxShadow.
-        for (const t of tiles) {
-          const s = window.getComputedStyle(t as Element);
-          const concat = [
-            s.borderTopColor, s.borderRightColor, s.borderBottomColor, s.borderLeftColor,
-            s.outlineColor, s.boxShadow,
-          ].join(" ");
-          if (isAccentBlue(concat)) return t;
-        }
-
-        // Strategy 3: "active"-suffixed class token.
-        for (const t of tiles) {
-          const cls = (t.getAttribute("class") ?? "").toLowerCase();
-          if (/\bactive\b|is-active|_active|--active/.test(cls)) return t;
-        }
-        return null;
+      function tilesForRoster(stage: Element): Element[] {
+        const audioTiles = Array.from(stage.querySelectorAll(tileSel));
+        if (audioTiles.length) return audioTiles as Element[];
+        return Array.from(stage.querySelectorAll(fallbackTileSel)) as Element[];
       }
 
-      function extractName(tile: Element): string {
+      function rosterIdLookup(stage: Element): Map<string, string> {
+        // Build a (participantId → name) map from the People-panel rows
+        // injected by peoplePanel.ts. The panel's roster items expose
+        // `data-participant-id`; tiles expose
+        // `data-requested-participant-id` with the same id, so we can
+        // canonicalize without scraping the tile's name label.
+        const map = new Map<string, string>();
+        const rows = document.querySelectorAll('[data-participant-id]');
+        rows.forEach((el) => {
+          const pid = el.getAttribute("data-participant-id");
+          if (!pid) return;
+          const aria = clean(el.getAttribute("aria-label"));
+          if (aria && !isNoise(aria) && aria.split(/\s+/).length <= 5) {
+            map.set(pid, aria);
+            return;
+          }
+          const span = el.querySelector("span");
+          const t = clean(span?.textContent ?? "");
+          if (t && !isNoise(t)) map.set(pid, t);
+        });
+        return map;
+      }
+
+      function isSpeaking(tile: Element): boolean {
+        const lvl = tile.getAttribute("data-audio-level");
+        if (lvl !== null) {
+          const n = Number(lvl);
+          if (Number.isFinite(n) && n > 0) return true;
+          return false;
+        }
+        // Fallback: speaking class tokens (Meet's obfuscated names).
+        const cls = (tile.getAttribute("class") ?? "").toLowerCase();
+        return /\b(oaajhc|hx2h7|weslmd|ogvli|active|is-active|_active|--active)\b/.test(cls);
+      }
+
+      function nameForTile(tile: Element, lookup: Map<string, string>): string {
+        const reqPid = tile.getAttribute("data-requested-participant-id")
+          ?? tile.getAttribute("data-participant-id");
+        if (reqPid) {
+          const fromRoster = lookup.get(reqPid);
+          if (fromRoster) return fromRoster;
+        }
         const self = tile.getAttribute("data-self-name");
         if (self && !isNoise(self)) return clean(self);
         const aria = tile.getAttribute("aria-label");
         if (aria && !isNoise(aria)) return clean(aria);
-
         const candidates: string[] = [];
         for (const node of Array.from(tile.querySelectorAll(nameSel))) {
           const t = clean((node as HTMLElement).textContent);
@@ -128,80 +139,111 @@ export async function startActiveSpeakerPoller(
           candidates.sort((a, b) => a.length - b.length);
           return candidates[0];
         }
-        const raw = clean(tile.textContent);
-        if (!isNoise(raw)) {
-          const lines = raw.split("\n").map((l) => l.trim()).filter(Boolean);
-          lines.sort((a, b) => a.length - b.length);
-          if (lines[0] && !isNoise(lines[0])) return lines[0];
-        }
         return "";
       }
 
       let lastName = "";
-      let firstMissLogged = false;
+      let lastEmitMs = 0;
+      let snapshotDeadline = Date.now() + snapshotTimeoutMs;
 
-      const tick = () => {
-        try {
-          const stage = findStage();
-          const tile = findActiveTile(stage);
-          if (!tile) {
-            if (!firstMissLogged) {
-              firstMissLogged = true;
-              const w = window as unknown as {
-                __renateDumpActiveSpeakerSnapshot?: (s: unknown) => Promise<void>;
-              };
-              if (w.__renateDumpActiveSpeakerSnapshot) {
-                const sample = Array.from(stage.querySelectorAll(tileSel))
-                  .slice(0, 3)
-                  .map((t) => (t as HTMLElement).outerHTML.slice(0, 400));
-                void w.__renateDumpActiveSpeakerSnapshot({
-                  tileSel,
-                  sampleTiles: sample,
-                });
-              }
-            }
-            return;
+      function emitFor(stage: Element) {
+        const lookup = rosterIdLookup(stage);
+        const tiles = tilesForRoster(stage);
+        let speaker: Element | null = null;
+        for (const t of tiles) {
+          if (isSpeaking(t)) {
+            speaker = t;
+            break;
           }
-          const name = extractName(tile);
-          if (!name || name === lastName) return;
-          lastName = name;
-          const w = window as unknown as {
-            __renatePushActiveSpeaker?: (ev: unknown) => Promise<void>;
-          };
-          if (w.__renatePushActiveSpeaker) {
-            void w.__renatePushActiveSpeaker({ tMs: Date.now(), name });
-          }
-        } catch {
-          // The Meet DOM can briefly tear between renders; a single failed
-          // tick is fine — the next 200ms will retry.
         }
-      };
+        if (!speaker) {
+          if (Date.now() > snapshotDeadline) {
+            snapshotDeadline = Date.now() + snapshotTimeoutMs;
+            const w = window as unknown as {
+              __renateDumpActiveSpeakerSnapshot?: (s: unknown) => Promise<void>;
+            };
+            if (w.__renateDumpActiveSpeakerSnapshot) {
+              void w.__renateDumpActiveSpeakerSnapshot({
+                tileSel,
+                fallbackTileSel,
+                tilesObserved: tiles.length,
+                sampleTiles: tiles
+                  .slice(0, 3)
+                  .map((t) => (t as HTMLElement).outerHTML.slice(0, 400)),
+              });
+            }
+          }
+          return;
+        }
+        const name = nameForTile(speaker, lookup);
+        if (!name) return;
+        const now = Date.now();
+        if (name === lastName && now - lastEmitMs < debounceMs) return;
+        lastName = name;
+        lastEmitMs = now;
+        const w = window as unknown as {
+          __renatePushActiveSpeaker?: (ev: unknown) => Promise<void>;
+        };
+        if (w.__renatePushActiveSpeaker) {
+          void w.__renatePushActiveSpeaker({ tMs: now, name });
+        }
+      }
 
-      const timer = setInterval(tick, pollMs);
-      (window as unknown as { __renateActiveSpeakerTimer?: ReturnType<typeof setInterval> })
-        .__renateActiveSpeakerTimer = timer;
+      function attach(stage: Element) {
+        // Initial sweep so we don't wait for the first attribute mutation.
+        emitFor(stage);
+        const obs = new MutationObserver(() => emitFor(stage));
+        obs.observe(stage, {
+          attributes: true,
+          attributeFilter: ["data-audio-level", "class"],
+          subtree: true,
+          childList: true,
+        });
+        (window as unknown as { __renateActiveSpeakerObserver?: MutationObserver })
+          .__renateActiveSpeakerObserver = obs;
+      }
+
+      const existing = findStage();
+      if (existing && existing !== document.body) {
+        attach(existing);
+        return;
+      }
+      // Stage hasn't rendered yet; poll briefly and attach.
+      const poll = setInterval(() => {
+        const s = findStage();
+        if (s && s !== document.body) {
+          clearInterval(poll);
+          attach(s);
+        }
+      }, 500);
+      (window as unknown as { __renateActiveSpeakerPoll?: ReturnType<typeof setInterval> })
+        .__renateActiveSpeakerPoll = poll;
     },
     {
       stageSel: selectors.activeStageContainer,
       tileSel: selectors.activeTileCandidates,
+      fallbackTileSel: selectors.activeTileFallback,
       nameSel: selectors.activeTileNameLabel,
-      pollMs: POLL_MS,
+      debounceMs: REPORT_DEBOUNCE_MS,
+      snapshotTimeoutMs: SNAPSHOT_TIMEOUT_MS,
     }
   );
 
-  log.info({ pollMs: POLL_MS }, "active-speaker poller attached");
+  log.info({ debounceMs: REPORT_DEBOUNCE_MS }, "active-speaker observer attached");
 
   return {
     async stop() {
       await page
         .evaluate(() => {
           const w = window as unknown as {
-            __renateActiveSpeakerTimer?: ReturnType<typeof setInterval>;
+            __renateActiveSpeakerObserver?: MutationObserver;
+            __renateActiveSpeakerPoll?: ReturnType<typeof setInterval>;
           };
-          if (w.__renateActiveSpeakerTimer) clearInterval(w.__renateActiveSpeakerTimer);
+          w.__renateActiveSpeakerObserver?.disconnect();
+          if (w.__renateActiveSpeakerPoll) clearInterval(w.__renateActiveSpeakerPoll);
         })
         .catch(() => {});
-      log.info({ count }, "active-speaker poller stopped");
+      log.info({ count }, "active-speaker observer stopped");
     },
     emitted: () => count,
   };

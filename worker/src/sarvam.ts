@@ -17,12 +17,21 @@ export interface TranscribeChunkInput {
   mode?: string;
 }
 
+export interface TranscribedWord {
+  startTs: number;
+  endTs: number;
+  text: string;
+}
+
 export interface TranscribedSegment {
   startTs: number;
   endTs: number;
   rawText: string;
   confidence: number | null;
   sarvamRequestId: string;
+  /** Word-level timestamps from Sarvam, in call-relative seconds.
+   *  Empty when Sarvam didn't return per-word timing for this chunk. */
+  words: TranscribedWord[];
 }
 
 export async function transcribeChunk(
@@ -90,6 +99,7 @@ export async function transcribeChunk(
       rawText: text,
       confidence: null,
       sarvamRequestId: requestId || json.request_id || "",
+      words: [],
     },
   ];
 }
@@ -101,13 +111,19 @@ function groupWords(
 ): TranscribedSegment[] {
   const GROUP_MS = 1500;
   const out: TranscribedSegment[] = [];
-  let cur: { words: string[]; start: number; end: number } | null = null;
+  let cur: {
+    words: string[];
+    wordTimings: TranscribedWord[];
+    start: number;
+    end: number;
+  } | null = null;
 
   for (const w of words) {
     const start = (w.start_time ?? 0) + offset;
     const end = (w.end_time ?? start) + offset;
+    const tw: TranscribedWord = { startTs: start, endTs: end, text: w.word };
     if (!cur) {
-      cur = { words: [w.word], start, end };
+      cur = { words: [w.word], wordTimings: [tw], start, end };
       continue;
     }
     if (end - cur.start > GROUP_MS / 1000) {
@@ -117,10 +133,12 @@ function groupWords(
         rawText: cur.words.join(" ").trim(),
         confidence: null,
         sarvamRequestId: reqId,
+        words: cur.wordTimings,
       });
-      cur = { words: [w.word], start, end };
+      cur = { words: [w.word], wordTimings: [tw], start, end };
     } else {
       cur.words.push(w.word);
+      cur.wordTimings.push(tw);
       cur.end = end;
     }
   }
@@ -131,6 +149,7 @@ function groupWords(
       rawText: cur.words.join(" ").trim(),
       confidence: null,
       sarvamRequestId: reqId,
+      words: cur.wordTimings,
     });
   }
   log.debug({ segments: out.length, reqId }, "sarvam grouped");

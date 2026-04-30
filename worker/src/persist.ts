@@ -13,13 +13,22 @@ export async function insertTranscriptSegments(
   let i = 1;
   for (const s of segments) {
     values.push(
-      `($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`
+      `($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++}::jsonb)`
     );
-    params.push(sessionId, chunkIdx, s.startTs, s.endTs, s.rawText, s.confidence, s.sarvamRequestId);
+    params.push(
+      sessionId,
+      chunkIdx,
+      s.startTs,
+      s.endTs,
+      s.rawText,
+      s.confidence,
+      s.sarvamRequestId,
+      JSON.stringify(s.words ?? [])
+    );
   }
   await pool.query(
     `INSERT INTO transcript_segments
-       (session_id, chunk_idx, start_ts, end_ts, raw_text, confidence, sarvam_request_id)
+       (session_id, chunk_idx, start_ts, end_ts, raw_text, confidence, sarvam_request_id, words)
      VALUES ${values.join(", ")}`,
     params
   );
@@ -28,19 +37,19 @@ export async function insertTranscriptSegments(
 export async function writeFinalTranscript(
   pool: Pool,
   sessionId: string,
-  rows: Array<{ startTs: number; endTs: number; speakerName: string; text: string }>
+  rows: Array<{ startTs: number; endTs: number; speakerName: string; text: string; cluster?: string | null }>
 ): Promise<void> {
   if (!rows.length) return;
   const values: string[] = [];
   const params: unknown[] = [];
   let i = 1;
   for (const r of rows) {
-    values.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
-    params.push(sessionId, r.startTs, r.endTs, r.speakerName, r.text);
+    values.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
+    params.push(sessionId, r.startTs, r.endTs, r.speakerName, r.text, r.cluster ?? null);
   }
   await pool.query(
     `INSERT INTO transcript_final
-       (session_id, start_ts, end_ts, speaker_name, text)
+       (session_id, start_ts, end_ts, speaker_name, text, cluster)
      VALUES ${values.join(", ")}`,
     params
   );

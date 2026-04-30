@@ -10,7 +10,7 @@ import { attachCaptionObserver } from "./captions.js";
 import type { CaptionObserverHandle } from "./captions.js";
 import { startActiveSpeakerPoller } from "./activeSpeaker.js";
 import type { ActiveSpeakerHandle } from "./activeSpeaker.js";
-import { scrapeRoster } from "./peoplePanel.js";
+import { startRosterObserver, type RosterObserverHandle } from "./peoplePanel.js";
 import { dumpMeetDom } from "./debug.js";
 import { waitForCallEnd } from "./endDetect.js";
 import { selectors } from "./selectors.js";
@@ -50,6 +50,7 @@ async function main() {
   let audio: AudioCaptureHandle | null = null;
   let captions: CaptionObserverHandle | null = null;
   let activeSpeaker: ActiveSpeakerHandle | null = null;
+  let roster: RosterObserverHandle | null = null;
 
   // Read Meet's participant count via the "people" button's aria-label.
   // Returns the total participant count (including the bot) or null if the
@@ -130,9 +131,21 @@ async function main() {
   const shutdown = async (sig: string, code = 0, endSignal?: string) => {
     log.info({ sig, endSignal }, "bot: shutting down");
     heartbeat.stop();
-    const rosterTimer = (globalThis as { __renateRosterTimer?: ReturnType<typeof setInterval> })
-      .__renateRosterTimer;
-    if (rosterTimer) clearInterval(rosterTimer);
+    const nodeWatchdog = (globalThis as {
+      __renateRosterNodeWatchdog?: ReturnType<typeof setInterval>;
+    }).__renateRosterNodeWatchdog;
+    if (nodeWatchdog) clearInterval(nodeWatchdog);
+    // Final roster snapshot BEFORE we tear down the page — Meet keeps the
+    // panel populated until the bot leaves, so this is a clean read of
+    // every participant present at end-of-call.
+    if (roster) {
+      try {
+        const finalNames = await roster.snapshot();
+        log.info({ finalNames }, "final roster snapshot");
+      } catch (err) {
+        log.error({ err }, "final roster snapshot failed");
+      }
+    }
     // Flush ffmpeg + upload tail chunks BEFORE touching finalize so no audio
     // gets orphaned. captions + active-speaker observers stop in parallel —
     // they're cheap.
@@ -142,9 +155,13 @@ async function main() {
     const activeSpeakerStop = activeSpeaker
       ? activeSpeaker.stop().catch((err) => log.error({ err }, "active-speaker stop"))
       : Promise.resolve();
+    const rosterStop = roster
+      ? roster.stop().catch((err) => log.error({ err }, "roster stop"))
+      : Promise.resolve();
     if (audio) await audio.stop().catch((err) => log.error({ err }, "audio stop"));
     await captionsStop;
     await activeSpeakerStop;
+    await rosterStop;
     // Wait for tail transcribe-chunk jobs to finish so finalize sees
     // transcript_segments for every chunk we uploaded.
     if (joined) await drainTranscribeQueue(45_000);
@@ -191,41 +208,18 @@ async function main() {
       )
     );
 
-    // Periodic roster scrape. If the bot joined before any humans, the
-    // People panel is empty at t+8s. Re-scrape every 30s for the duration
-    // of the call; persist whenever we get a non-empty list. The roster
-    // grows over the call as more people join — finalize uses the latest
-    // value. First attempt runs at t+8s.
-    let rosterPersisted = false;
-    const rosterTimer = setInterval(() => {
-      void scrapeRoster(joined!.page, cfg.DISPLAY_NAME)
-        .then((names) => {
-          if (names.length === 0) {
-            if (!rosterPersisted) log.warn("roster scrape returned no names; will retry");
-            return;
-          }
-          log.info({ names, persistedBefore: rosterPersisted }, "roster scraped");
-          rosterPersisted = true;
-          return setRoster(redis, cfg.SESSION_ID!, names);
-        })
-        .catch((err) => log.error({ err }, "roster scrape failed"));
-    }, 30_000);
-    (globalThis as { __renateRosterTimer?: ReturnType<typeof setInterval> })
-      .__renateRosterTimer = rosterTimer;
+    // Live roster: open the People panel once and watch it via a
+    // MutationObserver. Joiners + leavers (including silent participants)
+    // get pushed to Redis the moment Meet updates the panel. Replaces the
+    // previous 30-s setInterval which could miss anyone who joined between
+    // ticks.
+    roster = await startRosterObserver(joined.page, cfg.DISPLAY_NAME, (names) =>
+      setRoster(redis, cfg.SESSION_ID!, names).catch((err) =>
+        log.error({ err }, "setRoster failed")
+      )
+    );
 
     setTimeout(() => {
-      void scrapeRoster(joined!.page, cfg.DISPLAY_NAME)
-        .then((names) => {
-          if (names.length === 0) {
-            log.warn("roster scrape returned no names; will retry");
-            return;
-          }
-          log.info({ names }, "roster scraped");
-          rosterPersisted = true;
-          return setRoster(redis, cfg.SESSION_ID!, names);
-        })
-        .catch((err) => log.error({ err }, "roster scrape failed"));
-
       void dumpMeetDom(joined!.page).catch((err) =>
         log.error({ err }, "debug dump failed")
       );

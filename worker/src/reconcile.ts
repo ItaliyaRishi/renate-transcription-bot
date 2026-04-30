@@ -11,12 +11,6 @@ export interface DomCaptionRecord {
   text: string;
 }
 
-export interface TranscriptWord {
-  startTs: number;
-  endTs: number;
-  text: string;
-}
-
 export interface ReconciledSpeakerMap {
   [pyannoteCluster: string]: string;
 }
@@ -33,47 +27,82 @@ export interface NameEvent {
   source: "caption" | "tile";
 }
 
+export interface ResolveOptions {
+  /** Caption weight per overlapping event (default 2). */
+  captionWeight?: number;
+  /** Tile weight per overlapping event (default 3, since tile is per-cluster
+   *  separating evidence; captions are biased to whoever Meet's CC names. */
+  tileWeight?: number;
+}
+
 /**
  * Fuse caption + active-speaker-tile observations with diarization turns
- * to produce a cluster→displayName map.
+ * to produce a cluster→displayName map under a one-to-one constraint.
  *
- * Weighting: a caption badge counts 2× a tile hit — captions are emitted
- * by Meet's own name resolution, tiles just by visual highlight.
+ * Two clusters never get the same name. The previous implementation
+ * picked the highest-weighted name per cluster INDEPENDENTLY — when one
+ * speaker dominated the captions stream all clusters would resolve to
+ * the same human, then the merge step downstream collapsed everything
+ * into a single mega-row. We now solve the assignment globally:
  *
- * Canonicalization: a winning name that token-prefix-matches exactly one
- * roster entry is replaced by that roster entry (fixes truncated / first-
- * name-only caption badges like "Rishi" → "Rishi Italiya").
+ *   1. Build a `K × M` weight matrix W[c, n] = captionWeight × captionVotes
+ *      + tileWeight × tileVotes for every (cluster, candidate-name) pair.
+ *   2. Walk in descending weight order; greedily assign the next-best
+ *      (cluster, name) only when neither is already taken.
+ *   3. Clusters with no positive evidence fall through to roster-fill in
+ *      first-appearance order, skipping names already used.
+ *   4. Anything still unresolved becomes "Speaker N".
  *
- * Fill: clusters with no event evidence take the next unused roster entry
- * in first-appearance order; anything still unresolved becomes "Speaker N".
+ * Greedy with a strict tie-break (cluster first-appearance time) is
+ * sufficient for the K ≤ 8 / M ≤ 16 sizes we see in practice and avoids
+ * pulling in a Hungarian library.
  */
 export function resolveClusterNames(
   turns: PyannoteTurn[],
   nameEvents: NameEvent[],
-  roster: string[]
+  roster: string[],
+  opts: ResolveOptions = {}
 ): {
   clusterToName: Record<string, string>;
   resolution: Record<string, "caption" | "tile" | "roster" | "fallback">;
+  weightMatrix: Record<string, Record<string, number>>;
 } {
+  const captionWeight = opts.captionWeight ?? 2;
+  const tileWeight = opts.tileWeight ?? 3;
+
   const clusterToName: Record<string, string> = {};
   const resolution: Record<string, "caption" | "tile" | "roster" | "fallback"> = {};
-  if (!turns.length) return { clusterToName, resolution };
+  const weightMatrix: Record<string, Record<string, number>> = {};
+  if (!turns.length) return { clusterToName, resolution, weightMatrix };
 
-  const byCluster = new Map<string, PyannoteTurn[]>();
+  // Cluster first-appearance order — used both for stable greedy tie-breaks
+  // and for roster fallback.
+  const firstAppearance: string[] = [];
+  const seen = new Set<string>();
+  for (const t of [...turns].sort((a, b) => a.startTs - b.startTs)) {
+    if (seen.has(t.cluster)) continue;
+    seen.add(t.cluster);
+    firstAppearance.push(t.cluster);
+  }
+  const clusterOrder = new Map<string, number>();
+  firstAppearance.forEach((c, i) => clusterOrder.set(c, i));
+
+  const turnsByCluster = new Map<string, PyannoteTurn[]>();
   for (const t of turns) {
-    const arr = byCluster.get(t.cluster) ?? [];
+    const arr = turnsByCluster.get(t.cluster) ?? [];
     arr.push(t);
-    byCluster.set(t.cluster, arr);
+    turnsByCluster.set(t.cluster, arr);
   }
 
-  const scores = new Map<string, Map<string, { caption: number; tile: number }>>();
-  for (const c of byCluster.keys()) scores.set(c, new Map());
+  // Tally per-cluster, per-name caption + tile votes.
+  type Tally = { caption: number; tile: number };
+  const scores = new Map<string, Map<string, Tally>>();
+  for (const c of firstAppearance) scores.set(c, new Map());
 
   for (const ev of nameEvents) {
-    const name = ev.name.trim();
+    const name = canonicalNameKey(ev.name);
     if (!name) continue;
-    if (/^(you|me)$/i.test(name)) continue;
-    for (const [cluster, clusterTurns] of byCluster.entries()) {
+    for (const [cluster, clusterTurns] of turnsByCluster.entries()) {
       if (!clusterTurns.some((t) => ev.tSec >= t.startTs && ev.tSec <= t.endTs)) continue;
       const perName = scores.get(cluster)!;
       const s = perName.get(name) ?? { caption: 0, tile: 0 };
@@ -84,32 +113,50 @@ export function resolveClusterNames(
     }
   }
 
-  const usedNames = new Set<string>();
+  // Flatten into a (cluster, name, weight, source) candidate list. Walk
+  // descending; assign greedily when both row and column are still free.
+  interface Cand {
+    cluster: string;
+    name: string;
+    weight: number;
+    source: "caption" | "tile";
+  }
+  const cands: Cand[] = [];
   for (const [cluster, perName] of scores.entries()) {
-    let winner: { name: string; weight: number; source: "caption" | "tile" } | null = null;
+    const wRow: Record<string, number> = {};
     for (const [name, s] of perName.entries()) {
-      const weight = s.caption * 2 + s.tile;
-      if (!winner || weight > winner.weight) {
-        winner = { name, weight, source: s.caption >= s.tile ? "caption" : "tile" };
-      }
+      const weight = s.caption * captionWeight + s.tile * tileWeight;
+      if (weight <= 0) continue;
+      wRow[name] = weight;
+      cands.push({
+        cluster,
+        name,
+        weight,
+        source: s.tile * tileWeight >= s.caption * captionWeight ? "tile" : "caption",
+      });
     }
-    if (!winner) continue;
-    const canon = canonicalizeAgainstRoster(winner.name, roster);
-    const finalName = canon ?? winner.name;
-    clusterToName[cluster] = finalName;
-    resolution[cluster] = winner.source;
-    usedNames.add(finalName.toLowerCase());
+    weightMatrix[cluster] = wRow;
+  }
+  cands.sort((a, b) => {
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    return (clusterOrder.get(a.cluster) ?? 0) - (clusterOrder.get(b.cluster) ?? 0);
+  });
+
+  const usedNamesLower = new Set<string>();
+  for (const c of cands) {
+    if (clusterToName[c.cluster]) continue;
+    const canon = canonicalizeAgainstRoster(c.name, roster) ?? c.name;
+    const lower = canon.toLowerCase();
+    if (usedNamesLower.has(lower)) continue;
+    clusterToName[c.cluster] = canon;
+    resolution[c.cluster] = c.source;
+    usedNamesLower.add(lower);
   }
 
-  // First-appearance cluster order, for stable roster fill.
-  const firstAppearance: string[] = [];
-  const seen = new Set<string>();
-  for (const t of [...turns].sort((a, b) => a.startTs - b.startTs)) {
-    if (seen.has(t.cluster)) continue;
-    seen.add(t.cluster);
-    firstAppearance.push(t.cluster);
-  }
-  const availableRoster = roster.filter((n) => !usedNames.has(n.toLowerCase()));
+  // Roster fill for clusters with no evidence (or whose only candidate
+  // names were already taken). First-appearance order keeps assignment
+  // deterministic across reruns.
+  const availableRoster = roster.filter((n) => !usedNamesLower.has(n.toLowerCase()));
   let fallbackCounter = 1;
   for (const cluster of firstAppearance) {
     if (clusterToName[cluster]) continue;
@@ -117,14 +164,21 @@ export function resolveClusterNames(
     if (next) {
       clusterToName[cluster] = next;
       resolution[cluster] = "roster";
-      usedNames.add(next.toLowerCase());
+      usedNamesLower.add(next.toLowerCase());
     } else {
       clusterToName[cluster] = `Speaker ${fallbackCounter++}`;
       resolution[cluster] = "fallback";
     }
   }
 
-  return { clusterToName, resolution };
+  return { clusterToName, resolution, weightMatrix };
+}
+
+function canonicalNameKey(raw: string): string {
+  const t = raw.trim();
+  if (!t) return "";
+  if (/^(you|me|unknown)$/i.test(t)) return "";
+  return t;
 }
 
 function canonicalizeAgainstRoster(raw: string, roster: string[]): string | null {
@@ -133,7 +187,10 @@ function canonicalizeAgainstRoster(raw: string, roster: string[]): string | null
   const matches: string[] = [];
   for (const r of roster) {
     const rLow = r.toLowerCase();
-    if (rLow === rawLow) { matches.push(r); continue; }
+    if (rLow === rawLow) {
+      matches.push(r);
+      continue;
+    }
     const tokens = rLow.split(/\s+/);
     if (tokens.some((t) => t.length >= 3 && (t === rawLow || t.startsWith(rawLow)))) {
       matches.push(r);
@@ -141,61 +198,3 @@ function canonicalizeAgainstRoster(raw: string, roster: string[]): string | null
   }
   return matches.length === 1 ? matches[0] : null;
 }
-
-function overlapSeconds(aStart: number, aEnd: number, bStart: number, bEnd: number): number {
-  const s = Math.max(aStart, bStart);
-  const e = Math.min(aEnd, bEnd);
-  return Math.max(0, e - s);
-}
-
-/**
- * Merge transcript_segments (Sarvam words / utterances) with diarization
- * turns to produce final (speaker, text) rows. For each segment, assign
- * the speaker whose turn overlaps it most; fall back to "Unknown".
- *
- * Turns are split when the speaker changes OR the gap since the previous
- * segment exceeds MAX_GAP_SEC. Without a gap threshold, a single long
- * call collapses to one-row-per-speaker and loses all conversational
- * structure.
- */
-export function mergeSegmentsWithSpeakers(
-  segments: Array<{ startTs: number; endTs: number; text: string }>,
-  turns: PyannoteTurn[],
-  speakerMap: ReconciledSpeakerMap
-): Array<{ startTs: number; endTs: number; speakerName: string; text: string }> {
-  const MAX_GAP_SEC = 2.5;
-  const out: Array<{ startTs: number; endTs: number; speakerName: string; text: string }> = [];
-
-  for (const seg of segments) {
-    const best = pickBestOverlap(seg.startTs, seg.endTs, turns);
-    const name = best ? speakerMap[best.cluster] ?? best.cluster : "Unknown";
-    const last = out[out.length - 1];
-    const gap = last ? seg.startTs - last.endTs : Infinity;
-    if (last && last.speakerName === name && gap < MAX_GAP_SEC) {
-      last.text = `${last.text} ${seg.text}`.trim();
-      last.endTs = seg.endTs;
-    } else {
-      out.push({
-        startTs: seg.startTs,
-        endTs: seg.endTs,
-        speakerName: name,
-        text: seg.text,
-      });
-    }
-  }
-  return out;
-}
-
-function pickBestOverlap(
-  segStart: number,
-  segEnd: number,
-  turns: PyannoteTurn[]
-): PyannoteTurn | null {
-  let best: { turn: PyannoteTurn; o: number } | null = null;
-  for (const t of turns) {
-    const o = overlapSeconds(segStart, segEnd, t.startTs, t.endTs);
-    if (o > 0 && (!best || o > best.o)) best = { turn: t, o };
-  }
-  return best?.turn ?? null;
-}
-

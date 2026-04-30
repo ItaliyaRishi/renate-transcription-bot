@@ -1,4 +1,4 @@
-# Renate Transcription Bot — Architecture (2026-04-24)
+# Renate Transcription Bot — Architecture (2026-04-26)
 
 Self-hosted Google Meet transcription + summarization. No Google APIs. Speaker
 attribution comes from DOM signals inside the Meet tab plus pyannote
@@ -164,7 +164,9 @@ Finalize `DEL`s all four after persisting to Postgres.
 ## Bot internals (per-session container)
 
 - `Xvfb :99` + `PulseAudio` null-sink (`meet_sink`) set up by
-  `bot/docker/entrypoint.sh`.
+  `bot/docker/entrypoint.sh`. Entrypoint uses a double-`wait` pattern so PID 1
+  blocks until Node's SIGTERM handler fully runs (drain + finalize + leave)
+  before the container exits.
 - Chromium launched via Playwright with backgrounding throttles disabled
   (`--disable-renderer-backgrounding`,
   `--disable-background-timer-throttling`,
@@ -173,19 +175,27 @@ Finalize `DEL`s all four after persisting to Postgres.
 - Audio: ffmpeg segment muxer with `-use_wallclock_as_timestamps 1` and a
   60 s watchdog that restarts ffmpeg from `lastSeenChunk + 1` if two
   consecutive chunks fall under 50 KB.
-- DOM captures:
-  - `captions.ts` — MutationObserver scoped to the caption container;
-    rejects mutations whose ancestor is `role="button"` (filters "Jump to
-    bottom").
+- DOM captures (all designed to handle the **empty-call → users-arrive**
+  sequence — bot may join before any human is present):
+  - `captions.ts` — fire-and-forget infinite retry loop on the captions
+    toggle (5 s backoff, 8 s verify timeout per attempt). The
+    MutationObserver attaches the moment Meet renders the caption
+    container, so captions start streaming as soon as the first human
+    speaks — even if that's 30 minutes into the call. Observer is scoped
+    to the caption-badge subtree and rejects mutations whose ancestor is
+    `role="button"` (filters "Jump to bottom").
   - `activeSpeaker.ts` — 5 Hz poll; 3 strategies for finding the active
-    tile: `data-active-speaker="true"`, accent-blue border, `/active/` class
-    token. Debounces to one event per name change.
-  - `peoplePanel.ts` — scrapes the People panel; scopes to panel container,
-    rejects `role="menuitem"` and spans inside `<button>` (filters
-    "Show in a tile", "Pin to your screen", …).
+    tile: `data-active-speaker="true"`, accent-blue border (`rgb(11, 87, 208)`),
+    `/active/` class token. Debounces to one event per name change.
+  - `peoplePanel.ts` — periodic re-scrape every 30 s for the duration of
+    the call; persists the latest non-empty roster. First attempt at t+8 s.
+    Scopes to the panel container, rejects `role="menuitem"` and spans
+    inside `<button>` (filters "Show in a tile", "Pin to your screen", …).
+- End-of-call detection: `endDetect.ts` watches for "You've left the meeting"
+  /  "Return to home screen" + a hard timeout (`CALL_HARD_TIMEOUT_MS`,
+  default 120 min).
 - Shutdown: SIGTERM → stop observers + ffmpeg → drain transcribe-chunk for
-  this session (≤ 45 s) → enqueue finalize → leave Meet. Entrypoint uses a
-  double-`wait` so PID 1 blocks until Node's handler fully runs.
+  this session (≤ 45 s) → enqueue finalize → leave Meet.
 
 ---
 
@@ -278,6 +288,25 @@ Sarvam `saaras:v3` with `SARVAM_MODE=translate` and
 `SARVAM_LANGUAGE_CODE=unknown`. Any supported language in → English out.
 Transcript and summary are always English regardless of what participants
 speak.
+
+---
+
+## Empty-call → users-arrive behavior
+
+When the bot joins before any human:
+
+| Component        | Behavior                                                                 |
+|------------------|--------------------------------------------------------------------------|
+| Captions toggle  | Retries forever at 5 s cadence until "Turn off captions" is verified     |
+| Caption observer | Polls for the caption container every 500 ms; attaches when it renders   |
+| Active-speaker   | 5 Hz poll runs continuously; emits when a tile becomes highlighted       |
+| Roster scrape    | First attempt at t+8 s, then every 30 s; persists latest non-empty list  |
+| Audio capture    | Runs from t=0 (silence chunks early; watchdog restarts on stalls)        |
+| End detection    | Hard timeout (`CALL_HARD_TIMEOUT_MS`) only — no early-quit on empty call |
+
+This means a bot that joins 10 min before participants will produce no caption
+or tile events for the first 10 min, then start streaming as soon as humans
+join and speak. Finalize sees all signals from the moment they appeared.
 
 ---
 
